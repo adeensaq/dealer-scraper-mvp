@@ -30,6 +30,8 @@ const CLOUDFRONT_ORIGIN_PATH_PREFIX = (
 const MAX_IMAGES_PER_VEHICLE = Number(process.env.MAX_IMAGES_PER_VEHICLE || 15);
 const IMAGE_FETCH_CONCURRENCY = Number(process.env.IMAGE_FETCH_CONCURRENCY || 3);
 const IMAGE_DOWNLOAD_CONCURRENCY = Number(process.env.IMAGE_DOWNLOAD_CONCURRENCY || 6);
+// For scrapers that must visit VDPs to extract full details (e.g., Applewood)
+const VDP_CONCURRENCY = Number(process.env.VDP_CONCURRENCY || 3);
 const DEBUG_IMAGES = String(process.env.DEBUG_IMAGES || "").trim() === "1";
 
 const DESKTOP_UA =
@@ -72,6 +74,15 @@ function parseNumberFromText(s) {
   if (!digits) return null;
   const n = Number(digits);
   return Number.isFinite(n) ? n : null;
+}
+
+function stripRegisteredSymbol(s) {
+  // Applewood uses the registered trademark symbol in titles (e.g., Ford®)
+  return String(s || "").replace(/\u00AE/g, "").replace(/®/g, "").trim();
+}
+
+function cleanWhitespace(s) {
+  return String(s || "").replace(/\s+/g, " ").trim();
 }
 
 function normalizeVin(vin) {
@@ -226,6 +237,223 @@ async function fetchVehicleImages(context, baseUrl, vid) {
 }
 
 /**
+ * Applewood (applewoodperformancecenter.com)
+ * - SRP is infinite scroll (URL does not change)
+ * - Must visit each VDP to extract details
+ * - Images are present on VDP page (gallery)
+ */
+async function scrapeApplewoodVdpUrls(page, inventoryUrl) {
+  await page.goto(inventoryUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
+
+  // Wait for at least one card link to appear
+  await page
+    .waitForSelector('a[href^="/inventory/Used-"]', { timeout: 30000 })
+    .catch(() => {});
+
+  // Infinite scroll until stable
+  let lastCount = 0;
+  let stableRounds = 0;
+  for (let i = 0; i < 160; i++) {
+    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+    await sleep(1200);
+
+    const count = await page.locator('a[href^="/inventory/Used-"]').count();
+    if (count === lastCount) stableRounds++;
+    else stableRounds = 0;
+    lastCount = count;
+
+    // Require a few stable rounds so late-loading cards are captured
+    if (stableRounds >= 6 && count > 0) break;
+  }
+
+  const urls = await page.$$eval('a[href^="/inventory/Used-"]', (as) => {
+    const out = [];
+    for (const a of as) {
+      const href = a.getAttribute("href");
+      if (!href) continue;
+      out.push(new URL(href, location.href).toString());
+    }
+    return out;
+  });
+
+  return [...new Set(urls)];
+}
+
+function parseYearMakeModelFromTitle(titleText) {
+  // Expected: "2016 Ford Focus" (Ford may include ®)
+  const cleaned = cleanWhitespace(stripRegisteredSymbol(titleText));
+  const m = cleaned.match(/^(\d{4})\s+(.+)$/);
+  if (!m) return { year: null, make: null, model: null, raw: cleaned };
+  const year = Number(m[1]);
+  const rest = m[2].trim();
+  const parts = rest.split(" ").filter(Boolean);
+  const make = parts[0] || null;
+  const model = parts.slice(1).join(" ") || null;
+  return {
+    year: Number.isFinite(year) ? year : null,
+    make,
+    model,
+    raw: cleaned,
+  };
+}
+
+async function scrapeApplewoodVdp(context, vdpUrl) {
+  const p = await context.newPage();
+  try {
+    await p.goto(vdpUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
+
+    // Title (Year/Make/Model)
+    const titleText = await p
+      .locator("h1")
+      .first()
+      .innerText()
+      .catch(() => "");
+    const ymm = parseYearMakeModelFromTitle(titleText);
+
+    // Trim: bodyLarge paragraph under title (module classnames are hashed, so match stable fragments)
+    const trimText = await p
+      .locator('p[class*="Text-module"][class*="bodyLarge"] span')
+      .first()
+      .innerText()
+      .catch(async () => {
+        // Fallback: first non-empty paragraph
+        return await p
+          .locator("p")
+          .filter({ hasText: /\S/ })
+          .first()
+          .innerText()
+          .catch(() => "");
+      });
+
+    // Prefer explicit selectors where possible, but fall back to label-based parsing.
+    const vdpData = await p.evaluate(() => {
+      const clean = (s) => String(s || "").replace(/\s+/g, " ").trim();
+      const text = clean(document.body.innerText);
+
+      // Try to capture the "Kilometres: X • VIN: Y • Stock #: Z" banner first.
+      const banner = text.match(
+        /Kilometres:\s*([\d,]+)\s*[•\-–]\s*VIN:\s*([A-HJ-NPR-Z0-9]{11,17})\s*[•\-–]\s*Stock\s*#:\s*([A-Z0-9\-]+)/i
+      );
+
+      // Fallback values
+      const mileage = banner?.[1] || (text.match(/Mileage\s*([\d,]+)/i)?.[1] ?? null);
+      const vin = banner?.[2] || (text.match(/\bVIN\s*[:#]?\s*([A-HJ-NPR-Z0-9]{11,17})\b/i)?.[1] ?? null);
+      const stock =
+        banner?.[3] ||
+        (text.match(/\bStock\s*#\s*[:#]?\s*([A-Z0-9\-]+)\b/i)?.[1] ?? null);
+
+      // Price: prefer "Purchase Price" then "Retail Price".
+      const purchasePrice = text.match(/Purchase Price\s*\$\s*([\d,]+)/i)?.[1] ?? null;
+      const retailPrice = text.match(/Retail Price\s*\$\s*([\d,]+)/i)?.[1] ?? null;
+      const price = purchasePrice || retailPrice || (text.match(/\$\s*([\d,]{4,})/)?.[1] ?? null);
+
+      const transmission = text.match(/Transmission\s*([A-Za-z0-9\- ]+)/i)?.[1] ?? null;
+      const exteriorColor = text.match(/Exterior Color\s*([A-Za-z0-9\- ]+)/i)?.[1] ?? null;
+
+      return {
+        mileage,
+        vin,
+        stock,
+        price,
+        transmission: transmission ? clean(transmission) : null,
+        exteriorColor: exteriorColor ? clean(exteriorColor) : null,
+      };
+    });
+
+    // Best-effort trim (your provided selector is reliable, but keep fallback)
+    const trim = cleanWhitespace(stripRegisteredSymbol(trimText)) || null;
+
+    // Images (Applewood):
+    // - The VDP shows the main image in-page (alt="image-0")
+    // - Clicking opens a PhotoSwipe gallery with next/prev arrows and alt="image-N"
+    // We collect from the page first, then (best-effort) page through the PhotoSwipe gallery
+    // to capture the complete set.
+
+    // First pass: in-page gallery images
+    let imageSourceUrls = await p.$$eval("img[alt^=\"image-\"]", (imgs) => {
+      const out = [];
+      for (const img of imgs) {
+        const src = img.getAttribute("src") || img.getAttribute("data-src") || "";
+        if (!src) continue;
+        if (src.startsWith("data:")) continue;
+        out.push(new URL(src, location.href).toString());
+      }
+      return out;
+    });
+
+    // Second pass: PhotoSwipe (click image-0, then click next until images stop changing)
+    try {
+      const mainImg = p.locator("img[alt=\"image-0\"]").first();
+      if ((await mainImg.count()) > 0) {
+        await mainImg.click({ timeout: 5000 });
+        // wait for the PhotoSwipe UI to appear
+        await p.waitForSelector(".pswp__content img[alt^=\"image-\"], button.pswp__button--arrow--next", { timeout: 8000 }).catch(() => {});
+        await p.waitForTimeout(250);
+      }
+
+      const seen = new Set(imageSourceUrls);
+      const popupImg = () => p.locator(".pswp__content img[alt^=\"image-\"]").first();
+      const nextBtn = () => p.locator("button.pswp__button--arrow--next");
+
+      let lastSrc = null;
+      for (let i = 0; i < Math.max(10, MAX_IMAGES_PER_VEHICLE * 3); i++) {
+        const src = await popupImg().getAttribute("src").catch(() => null);
+        if (src) {
+          const abs = toAbs(src, vdpUrl);
+          seen.add(abs);
+        }
+
+        // If src is unchanged after a next click, we are likely at the end
+        const nbCount = await nextBtn().count().catch(() => 0);
+        if (!nbCount) break;
+
+        const before = src || lastSrc;
+        await nextBtn().click().catch(() => {});
+        await p.waitForTimeout(350);
+
+        const after = await popupImg().getAttribute("src").catch(() => null);
+        if (!after || (before && after === before)) {
+          // one extra short wait for slow transitions
+          await p.waitForTimeout(350);
+          const after2 = await popupImg().getAttribute("src").catch(() => null);
+          if (!after2 || (before && after2 === before)) break;
+          lastSrc = after2;
+        } else {
+          lastSrc = after;
+        }
+      }
+
+      // Close gallery
+      await p.keyboard.press("Escape").catch(() => {});
+
+      imageSourceUrls = [...seen];
+    } catch (_) {
+      // Ignore PhotoSwipe errors; we will fall back to in-page images
+    }
+
+    const dedupedImages = [...new Set(imageSourceUrls)].slice(0, MAX_IMAGES_PER_VEHICLE);
+
+
+    return {
+      url: vdpUrl,
+      year: ymm.year,
+      make: ymm.make,
+      model: ymm.model,
+      trim,
+      vin: vdpData.vin,
+      stockNumber: vdpData.stock,
+      mileage: vdpData.mileage,
+      price: vdpData.price,
+      transmission: vdpData.transmission,
+      exteriorColor: vdpData.exteriorColor,
+      imageSourceUrls: dedupedImages,
+    };
+  } finally {
+    await p.close().catch(() => {});
+  }
+}
+
+/**
  * Concurrency runner
  */
 async function mapWithConcurrency(items, concurrency, fn) {
@@ -328,6 +556,11 @@ async function downloadAndUploadImage({ imageUrlAbs, s3KeyBase }) {
   const startedAt = new Date().toISOString();
   const runId = crypto.randomUUID();
 
+  const IS_APPLEWOOD =
+    /applewoodperformancecenter\.com/i.test(INVENTORY_URL) ||
+    /applewoodperformancecenter/i.test(SCRAPER_ID) ||
+    /applewood/i.test(DEALER_ID);
+
   const browser = await chromium.launch({ headless: true });
   const context = await browser.newContext({ userAgent: DESKTOP_UA });
   const page = await context.newPage();
@@ -341,132 +574,143 @@ async function downloadAndUploadImage({ imageUrlAbs, s3KeyBase }) {
   const runS3Key = `runs/${DEALER_ID}/${yyyy}/${mm}/${dd}/${ts}_${runId}.json`;
 
   try {
-    await page.goto(INVENTORY_URL, { waitUntil: "domcontentloaded", timeout: 60000 });
+    let vehicles = [];
 
-    // Wait for vehicle anchors
-    for (let i = 0; i < 30; i++) {
-      const found = await page.locator("div.bold.fsize16.vnamelink a.styleColor").count();
-      if (found > 0) break;
-      await sleep(1000);
-    }
+    if (IS_APPLEWOOD) {
+      // Applewood: SRP -> VDP URLs -> scrape each VDP for details + images
+      const vdpUrls = await scrapeApplewoodVdpUrls(page, INVENTORY_URL);
+      vehicles = await mapWithConcurrency(vdpUrls, VDP_CONCURRENCY, async (url) => {
+        return await scrapeApplewoodVdp(context, url);
+      });
+    } else {
+      // Bank Street Hyundai (legacy scraper)
+      await page.goto(INVENTORY_URL, { waitUntil: "domcontentloaded", timeout: 60000 });
 
-    // Infinite scroll until stable
-    let lastCount = 0;
-    let stableRounds = 0;
-    for (let i = 0; i < 120; i++) {
-      await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-      await sleep(2000);
+      // Wait for vehicle anchors
+      for (let i = 0; i < 30; i++) {
+        const found = await page.locator("div.bold.fsize16.vnamelink a.styleColor").count();
+        if (found > 0) break;
+        await sleep(1000);
+      }
 
-      const linksNow = await page.locator("div.bold.fsize16.vnamelink a.styleColor").count();
-      if (linksNow === lastCount) stableRounds++;
-      else stableRounds = 0;
+      // Infinite scroll until stable
+      let lastCount = 0;
+      let stableRounds = 0;
+      for (let i = 0; i < 120; i++) {
+        await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+        await sleep(2000);
 
-      lastCount = linksNow;
-      if (stableRounds >= 5 && linksNow > 0) break;
-    }
+        const linksNow = await page.locator("div.bold.fsize16.vnamelink a.styleColor").count();
+        if (linksNow === lastCount) stableRounds++;
+        else stableRounds = 0;
 
-    const vehicles = await page.$$eval("div.row.nomargin", (cards) => {
-      const vehicles = [];
-      const seen = new Set();
+        lastCount = linksNow;
+        if (stableRounds >= 5 && linksNow > 0) break;
+      }
 
-      for (const card of cards) {
-        try {
-          const linkEl = card.querySelector("div.bold.fsize16.vnamelink a.styleColor");
-          const href = linkEl?.getAttribute("href");
-          if (!href) continue;
+      vehicles = await page.$$eval("div.row.nomargin", (cards) => {
+        const vehicles = [];
+        const seen = new Set();
 
-          const vdpUrl = new URL(href, location.href).toString();
-          const rawHeading = (linkEl?.textContent || "").trim();
+        for (const card of cards) {
+          try {
+            const linkEl = card.querySelector("div.bold.fsize16.vnamelink a.styleColor");
+            const href = linkEl?.getAttribute("href");
+            if (!href) continue;
 
-          let year = "unlisted",
-            make = "unlisted",
-            model = "unlisted",
-            trim = "unlisted";
-          const parts = rawHeading.split(/\s+/).filter(Boolean);
-          if (parts.length >= 2) {
-            year = parts[0];
-            make = parts[1];
-            if (parts.length >= 3) {
-              model = parts[2];
-              trim = parts.slice(3).join(" ") || "unlisted";
+            const vdpUrl = new URL(href, location.href).toString();
+            const rawHeading = (linkEl?.textContent || "").trim();
+
+            let year = "unlisted",
+              make = "unlisted",
+              model = "unlisted",
+              trim = "unlisted";
+            const parts = rawHeading.split(/\s+/).filter(Boolean);
+            if (parts.length >= 2) {
+              year = parts[0];
+              make = parts[1];
+              if (parts.length >= 3) {
+                model = parts[2];
+                trim = parts.slice(3).join(" ") || "unlisted";
+              }
             }
+
+            const labelValueMap = {};
+            card.querySelectorAll("span.result-data").forEach((span) => {
+              const kEl = span.querySelector("strong");
+              const vEl = span.querySelector(".result-value");
+              if (kEl && vEl) {
+                const key = kEl.textContent.replace(":", "").trim().toLowerCase();
+                labelValueMap[key] = vEl.textContent.trim();
+              }
+            });
+
+            const badge = card.querySelector(".carproof-badge");
+            const vinFromBadge = badge?.getAttribute("data-vin") || null;
+            const vin = vinFromBadge || labelValueMap["vin"] || "unlisted";
+
+            const stockNumber =
+              labelValueMap["stock#"] ||
+              labelValueMap["stock #"] ||
+              labelValueMap["stock"] ||
+              "unlisted";
+
+            const dedupeKey = vin !== "unlisted" ? `vin:${vin}` : `stock:${stockNumber}`;
+            if (seen.has(dedupeKey)) continue;
+            seen.add(dedupeKey);
+
+            const mileage = labelValueMap["mileage"] || "unlisted";
+            const exteriorColor =
+              labelValueMap["exterior"] || labelValueMap["exterior color"] || "unlisted";
+            const transmission =
+              labelValueMap["tran"] || labelValueMap["transmission"] || "unlisted";
+
+            let price = "unlisted";
+            const priceMatch = (card.innerText || "").match(/\$\d[\d,]+/);
+            if (priceMatch) price = priceMatch[0];
+
+            let vid = null;
+            const imagesLink = card.querySelector('div.result-blink a[onclick*="openVehImages("]');
+            const onclick = imagesLink?.getAttribute("onclick") || "";
+            const m = onclick.match(/openVehImages\((\d+)\s*,/);
+            if (m) vid = m[1];
+
+            vehicles.push({
+              vid,
+              url: vdpUrl,
+              year,
+              make,
+              model,
+              trim,
+              vin,
+              stockNumber,
+              mileage,
+              exteriorColor,
+              transmission,
+              price,
+              rawHeading,
+              overviewLabels: labelValueMap,
+            });
+          } catch {
+            // ignore per-card errors
           }
-
-          const labelValueMap = {};
-          card.querySelectorAll("span.result-data").forEach((span) => {
-            const kEl = span.querySelector("strong");
-            const vEl = span.querySelector(".result-value");
-            if (kEl && vEl) {
-              const key = kEl.textContent.replace(":", "").trim().toLowerCase();
-              labelValueMap[key] = vEl.textContent.trim();
-            }
-          });
-
-          const badge = card.querySelector(".carproof-badge");
-          const vinFromBadge = badge?.getAttribute("data-vin") || null;
-          const vin = vinFromBadge || labelValueMap["vin"] || "unlisted";
-
-          const stockNumber =
-            labelValueMap["stock#"] ||
-            labelValueMap["stock #"] ||
-            labelValueMap["stock"] ||
-            "unlisted";
-
-          const dedupeKey = vin !== "unlisted" ? `vin:${vin}` : `stock:${stockNumber}`;
-          if (seen.has(dedupeKey)) continue;
-          seen.add(dedupeKey);
-
-          const mileage = labelValueMap["mileage"] || "unlisted";
-          const exteriorColor =
-            labelValueMap["exterior"] || labelValueMap["exterior color"] || "unlisted";
-          const transmission =
-            labelValueMap["tran"] || labelValueMap["transmission"] || "unlisted";
-
-          let price = "unlisted";
-          const priceMatch = (card.innerText || "").match(/\$\d[\d,]+/);
-          if (priceMatch) price = priceMatch[0];
-
-          let vid = null;
-          const imagesLink = card.querySelector('div.result-blink a[onclick*="openVehImages("]');
-          const onclick = imagesLink?.getAttribute("onclick") || "";
-          const m = onclick.match(/openVehImages\((\d+)\s*,/);
-          if (m) vid = m[1];
-
-          vehicles.push({
-            vid,
-            url: vdpUrl,
-            year,
-            make,
-            model,
-            trim,
-            vin,
-            stockNumber,
-            mileage,
-            exteriorColor,
-            transmission,
-            price,
-            rawHeading,
-            overviewLabels: labelValueMap,
-          });
-        } catch {
-          // ignore per-card errors
         }
-      }
-      return vehicles;
-    });
+        return vehicles;
+      });
 
-    // ✅ ALWAYS fetch image source URLs for all vehicles
-    const imageUrlResults = await mapWithConcurrency(
-      vehicles,
-      IMAGE_FETCH_CONCURRENCY,
-      async (v) => {
-        const rel = await fetchVehicleImages(context, INVENTORY_URL, v.vid);
-        return rel.map((src) => toAbs(src, INVENTORY_URL));
-      }
-    );
+      // ✅ ALWAYS fetch image source URLs for all vehicles
+      const imageUrlResults = await mapWithConcurrency(
+        vehicles,
+        IMAGE_FETCH_CONCURRENCY,
+        async (v) => {
+          const rel = await fetchVehicleImages(context, INVENTORY_URL, v.vid);
+          return rel.map((src) => toAbs(src, INVENTORY_URL));
+        }
+      );
 
-    for (let i = 0; i < vehicles.length; i++) {
-      vehicles[i].imageSourceUrls = imageUrlResults[i] || [];
+      for (let i = 0; i < vehicles.length; i++) {
+        vehicles[i].imageSourceUrls = imageUrlResults[i] || [];
+      }
     }
 
     // ✅ Normalize vehicles into final schema objects
