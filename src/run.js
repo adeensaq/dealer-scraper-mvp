@@ -371,123 +371,69 @@ function parseYearMakeModelFromTitle(titleText) {
 async function scrapeApplewoodVdp(context, vdpUrl) {
   const p = await context.newPage();
   try {
+    // Navigate
     await p.goto(vdpUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
 
-    // Wait for VDP hydration (these fields appear after initial DOMContentLoaded on many VDPs)
-    await p
-      .waitForFunction(() => {
-        const t = document.body?.innerText || "";
-        return (
-          t.includes("Vehicle Specifications") ||
-          t.includes("VIN") ||
-          t.includes("Stock #") ||
-          t.includes("Purchase Price") ||
-          t.includes("Retail Price")
-        );
-      }, { timeout: 25000 })
-      .catch(() => {});
+    // D) Broaden the "page ready" condition: title OR hero image.
+    // Some VDP variants hydrate the title late; others hydrate the carousel first.
+    await Promise.race([
+      p.waitForSelector('h1[class*="Text-module"]', { timeout: 45000 }),
+      p.waitForSelector('picture[class*="VehicleCarousel"] img', { timeout: 45000 }),
+    ]).catch(() => {});
 
-    // Title (Year/Make/Model)
-    const titleText = await p
-      .locator("h1")
-      .first()
-      .innerText()
-      .catch(() => "");
-    const ymm = parseYearMakeModelFromTitle(titleText);
+    // Small settle for client hydration
+    await p.waitForTimeout(800);
 
-    // Trim: bodyLarge paragraph under title (module classnames are hashed, so match stable fragments)
-    const trimText = await p
-      .locator('p[class*="Text-module"][class*="bodyLarge"] span')
-      .first()
-      .innerText()
-      .catch(async () => {
-        // Fallback: first non-empty paragraph
-        return await p
-          .locator("p")
-          .filter({ hasText: /\S/ })
-          .first()
-          .innerText()
-          .catch(() => "");
-      });
+    // --- Title / Trim / Price (from stable visible elements) ---
+    const titleText =
+      (await p
+        .locator('h1[class*="Text-module"] span')
+        .first()
+        .textContent()
+        .catch(() => null)) ||
+      (await p
+        .locator('h1[class*="Text-module"]')
+        .first()
+        .textContent()
+        .catch(() => null)) ||
+      null;
 
-    // Prefer explicit selectors where possible, but fall back to label-based parsing.
-        const extractVdpData = async () => {
-      return await p.evaluate(() => {
-        const raw = String(document.body?.innerText || "");
-        const collapsed = raw.replace(/\s+/g, " ").trim();
+    const ymm = parseYearMakeModelFromTitle(titleText || "");
 
-        // Banner can be bullet-separated or just spaced, so be flexible:
-        // "Kilometres: 78,385 • VIN: ... • Stock #: ..."
-        const banner =
-          collapsed.match(
-            /Kilometres\s*[:#]?\s*([\d,]+)\s*(?:[•\-–]|·|\||\s)\s*VIN\s*[:#]?\s*([A-HJ-NPR-Z0-9]{11,17})\s*(?:[•\-–]|·|\||\s)\s*Stock\s*#\s*[:#]?\s*([A-Z0-9\-]+)/i
-          ) || null;
+    // Trim: first bodyLarge paragraph under title area (best-effort)
+    const trim =
+      (await p
+        .locator('p[class*="Text-module"][class*="bodyLarge"] span')
+        .first()
+        .textContent()
+        .catch(() => null)) ||
+      (await p
+        .locator('p[class*="Text-module"][class*="bodyLarge"]')
+        .first()
+        .textContent()
+        .catch(() => null)) ||
+      null;
 
-        const mileage =
-          (banner && banner[1]) ||
-          (collapsed.match(/Kilometres\s*[:#]?\s*([\d,]+)/i)?.[1] ?? null) ||
-          (collapsed.match(/\bMileage\s*[:#]?\s*([\d,]+)/i)?.[1] ?? null);
+    // Price: look for $ on the page, prefer h3/price line
+    const priceText =
+      (await p
+        .locator('p[class*="Text-module"][class*="h3"] span:has-text("$")')
+        .first()
+        .textContent()
+        .catch(() => null)) ||
+      (await p
+        .locator('p[class*="Text-module"] span:has-text("$")')
+        .first()
+        .textContent()
+        .catch(() => null)) ||
+      null;
 
-        const vin =
-          (banner && banner[2]) ||
-          (collapsed.match(/\bVIN\s*[:#]?\s*([A-HJ-NPR-Z0-9]{11,17})\b/i)?.[1] ?? null);
+    const parsedPrice = priceText
+      ? Number(String(priceText).replace(/[^\d]/g, "")) || null
+      : null;
 
-        const stock =
-          (banner && banner[3]) ||
-          (collapsed.match(/\bStock\s*#\s*[:#]?\s*([A-Z0-9\-]+)\b/i)?.[1] ?? null);
-
-        // Price: prefer "Purchase Price" then "Retail Price"
-        const purchasePrice = collapsed.match(/Purchase Price\s*[:#]?\s*\$?\s*([\d,]+)/i)?.[1] ?? null;
-        const retailPrice = collapsed.match(/Retail Price\s*[:#]?\s*\$?\s*([\d,]+)/i)?.[1] ?? null;
-        const price = purchasePrice || retailPrice || (collapsed.match(/\$\s*([\d,]{4,})/)?.[1] ?? null);
-
-        // Line-based extraction (prevents capturing the whole rest of the page)
-        const txLine = raw.match(/(?:^|\n)\s*Transmission\s+([^\n]+)/i)?.[1] ?? null;
-        const exLine = raw.match(/(?:^|\n)\s*Exterior Color\s+([^\n]+)/i)?.[1] ?? null;
-
-        const clean = (s) => String(s || "").replace(/\s+/g, " ").trim();
-
-        return {
-          mileage: mileage ? clean(mileage) : null,
-          vin: vin ? clean(vin) : null,
-          stock: stock ? clean(stock) : null,
-          price: price ? clean(price) : null,
-          transmission: txLine ? clean(txLine) : null,
-          exteriorColor: exLine ? clean(exLine) : null,
-        };
-      });
-    };
-
-    let vdpData = await extractVdpData();
-
-    // Optional (but recommended): if a VDP comes back “empty”, retry once
-    const missingCritical = !vdpData.vin && !vdpData.stock && !vdpData.mileage && !vdpData.price;
-    if (missingCritical) {
-      console.warn("APPLEWOOD_VDP_EMPTY_RETRY:", { vdpUrl });
-      await p.reload({ waitUntil: "domcontentloaded", timeout: 60000 }).catch(() => {});
-      await p.waitForTimeout(1200);
-      // Re-wait for hydration but don't hard-fail the VDP
-      await p
-        .waitForFunction(() => {
-          const t = document.body?.innerText || "";
-          return (
-            t.includes("Vehicle Specifications") ||
-            t.includes("VIN") ||
-            t.includes("Stock #") ||
-            t.includes("Purchase Price") ||
-            t.includes("Retail Price")
-          );
-        }, { timeout: 25000 })
-        .catch(() => {});
-      vdpData = await extractVdpData();
-    }
-
-    // Best-effort trim (your provided selector is reliable, but keep fallback)
-    const trim = cleanWhitespace(stripRegisteredSymbol(trimText)) || null;
-
-    // Images (Applewood):
-    // - The VDP shows the main image in-page (alt="image-0")
-    // - Clicking opens a PhotoSwipe gallery with next/prev arrows and alt="image-N"
+    // --- Images (same logic as before) ---
+    // Clicking opens a PhotoSwipe gallery with next/prev arrows and alt="image-N"
     // We collect from the page first, then (best-effort) page through the PhotoSwipe gallery
     // to capture the complete set.
 
@@ -503,20 +449,19 @@ async function scrapeApplewoodVdp(context, vdpUrl) {
       return out;
     });
 
-    // Second pass: PhotoSwipe (click image-0, then click next until images stop changing)
-    try {
-      const mainImg = p.locator('img[alt="image-0"]').first();
-      if ((await mainImg.count()) > 0) {
-        await mainImg.click({ timeout: 5000 });
-        // wait for the PhotoSwipe UI to appear
-        await p
-          .waitForSelector(
-            '.pswp__content img[alt^="image-"], button.pswp__button--arrow--next',
-            { timeout: 8000 }
-          )
-          .catch(() => {});
-        await p.waitForTimeout(250);
-      }
+    // Try to open PhotoSwipe by clicking the main image if present
+    const mainImg = p.locator('picture[class*="VehicleCarousel"] img[alt^="image-"]').first();
+    if ((await mainImg.count().catch(() => 0)) > 0) {
+      await mainImg.click({ timeout: 8000 }).catch(() => {});
+      await p.waitForTimeout(600);
+
+      const toAbs = (src, base) => {
+        try {
+          return new URL(src, base).toString();
+        } catch {
+          return src;
+        }
+      };
 
       const seen = new Set(imageSourceUrls);
       const popupImg = () => p.locator('.pswp__content img[alt^="image-"]').first();
@@ -531,32 +476,110 @@ async function scrapeApplewoodVdp(context, vdpUrl) {
         }
 
         // If src is unchanged after a next click, we are likely at the end
-        const nbCount = await nextBtn().count().catch(() => 0);
-        if (!nbCount) break;
+        const canNext = await nextBtn().isVisible().catch(() => false);
+        if (!canNext) break;
 
-        const before = src || lastSrc;
         await nextBtn().click().catch(() => {});
-        await p.waitForTimeout(350);
+        await p.waitForTimeout(450);
 
-        const after = await popupImg().getAttribute("src").catch(() => null);
-        if (!after || (before && after === before)) {
-          // one extra short wait for slow transitions
-          await p.waitForTimeout(350);
-          const after2 = await popupImg().getAttribute("src").catch(() => null);
-          if (!after2 || (before && after2 === before)) break;
-          lastSrc = after2;
-        } else {
-          lastSrc = after;
+        const nextSrc = await popupImg().getAttribute("src").catch(() => null);
+        if (nextSrc && nextSrc === lastSrc) break;
+        lastSrc = nextSrc || lastSrc;
+
+        // Early stop if we've already collected enough
+        if (seen.size >= MAX_IMAGES_PER_VEHICLE) break;
+      }
+
+      imageSourceUrls = Array.from(seen);
+    }
+
+    // A) + B) Ensure Basic Details are hydrated before extracting VIN/stock/mileage/etc.
+    // Some VDPs load these cards after hero/images and only after scrolling.
+    await p.evaluate(() => window.scrollTo(0, document.body.scrollHeight)).catch(() => {});
+    await p.waitForTimeout(1200);
+
+    await p
+      .waitForFunction(() => {
+        const els = Array.from(document.querySelectorAll('div[class*="BasicDetail"]'));
+        return els.some((el) => (el.innerText || "").trim().length > 20);
+      }, { timeout: 30000 })
+      .catch(() => {});
+
+    // C) Extract VIN/Stock via content inference (not positional), plus other details via DOM.
+    const vdpData = await p.evaluate(() => {
+      const clean = (s) => String(s || "").replace(/\s+/g, " ").trim();
+
+      // VIN + Stock appear in similar nodes; infer by patterns.
+      const basicInfoNodes = Array.from(document.querySelectorAll('p[class*="BasicInfoTitle"]'));
+      const basicInfoTexts = basicInfoNodes
+        .map((n) => clean(n.textContent))
+        .filter(Boolean);
+
+      let vin = null;
+      let stockNumber = null;
+
+      for (const t of basicInfoTexts) {
+        const text = t.replace(/\s+/g, "");
+        // VIN: 17 chars, excludes I/O/Q
+        if (/^[A-HJ-NPR-Z0-9]{17}$/i.test(text)) {
+          vin = text.toUpperCase();
+          continue;
+        }
+      }
+      for (const t of basicInfoTexts) {
+        const text = clean(t).replace(/\s+/g, "");
+        if (!text) continue;
+        if (vin && text.toUpperCase() === vin) continue;
+        // Stock tends to be short-ish and alnum/hyphen
+        if (/^[A-Z0-9-]{4,12}$/i.test(text) && !(vin && text.length === 17)) {
+          stockNumber = text.toUpperCase();
+          break;
         }
       }
 
-      // Close gallery
-      await p.keyboard.press("Escape").catch(() => {});
+      // Mileage: odometer text is typically a dedicated element
+      const mileageText =
+        clean(document.querySelector('[class*="odometer"]')?.textContent) || null;
 
-      imageSourceUrls = [...seen];
-    } catch (_) {
-      // Ignore PhotoSwipe errors; we will fall back to in-page images
-    }
+      const mileageKm = mileageText
+        ? Number(mileageText.replace(/[^\d]/g, "")) || null
+        : null;
+
+      // Pull BasicDetailCardItem entries and map by label contained in text
+      const detailItems = Array.from(document.querySelectorAll('div[class*="BasicDetailCardItem"]'));
+      const findByLabel = (labelRegex) => {
+        for (const el of detailItems) {
+          const t = clean(el.innerText);
+          if (!t) continue;
+          if (labelRegex.test(t)) {
+            // Usually "Label Value" — take the last token line
+            const lines = t.split("\n").map(clean).filter(Boolean);
+            if (lines.length >= 2) return lines[lines.length - 1];
+            // Fallback: remove label words
+            return t.replace(labelRegex, "").trim() || null;
+          }
+        }
+        return null;
+      };
+
+      const transmission =
+        findByLabel(/\btransmission\b/i) ||
+        clean(document.querySelector('div[class*="BasicDetailCardItem"][title]')?.getAttribute("title")) ||
+        null;
+
+      const exteriorColor =
+        findByLabel(/\bexterior\b/i) ||
+        clean(document.querySelector('[class*="BasicDetailColorDisplay"] span')?.textContent) ||
+        null;
+
+      return {
+        vin: vin || null,
+        stockNumber: stockNumber || null,
+        mileageKm,
+        transmission: transmission ? clean(transmission) : null,
+        exteriorColor: exteriorColor ? clean(exteriorColor) : null,
+      };
+    });
 
     const dedupedImages = [...new Set(imageSourceUrls)].slice(0, MAX_IMAGES_PER_VEHICLE);
 
@@ -565,11 +588,11 @@ async function scrapeApplewoodVdp(context, vdpUrl) {
       year: ymm.year,
       make: ymm.make,
       model: ymm.model,
-      trim,
+      trim: trim ? cleanWhitespace(stripRegisteredSymbol(trim)) : null,
       vin: vdpData.vin,
-      stockNumber: vdpData.stock,
-      mileage: vdpData.mileage,
-      price: vdpData.price,
+      stockNumber: vdpData.stockNumber,
+      mileage: vdpData.mileageKm,
+      price: parsedPrice,
       transmission: vdpData.transmission,
       exteriorColor: vdpData.exteriorColor,
       imageSourceUrls: dedupedImages,
@@ -578,6 +601,7 @@ async function scrapeApplewoodVdp(context, vdpUrl) {
     await p.close().catch(() => {});
   }
 }
+
 
 
 async function withTimeout(promise, ms, label = "timeout") {
