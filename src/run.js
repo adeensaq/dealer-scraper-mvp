@@ -373,6 +373,20 @@ async function scrapeApplewoodVdp(context, vdpUrl) {
   try {
     await p.goto(vdpUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
 
+// Wait for VDP hydration (these fields appear after initial DOMContentLoaded on many VDPs)
+await p
+  .waitForFunction(() => {
+    const t = document.body?.innerText || "";
+    return (
+      t.includes("Vehicle Specifications") ||
+      t.includes("VIN") ||
+      t.includes("Stock #") ||
+      t.includes("Purchase Price") ||
+      t.includes("Retail Price")
+    );
+  }, { timeout: 25000 })
+  .catch(() => {});
+
     // Title (Year/Make/Model)
     const titleText = await p
       .locator("h1")
@@ -397,41 +411,64 @@ async function scrapeApplewoodVdp(context, vdpUrl) {
       });
 
     // Prefer explicit selectors where possible, but fall back to label-based parsing.
-    const vdpData = await p.evaluate(() => {
-      const clean = (s) => String(s || "").replace(/\s+/g, " ").trim();
-      const text = clean(document.body.innerText);
+    const extractVdpData = async () => {
+  return await p.evaluate(() => {
+    const raw = String(document.body?.innerText || "");
+    const collapsed = raw.replace(/\s+/g, " ").trim();
 
-      // Try to capture the "Kilometres: X • VIN: Y • Stock #: Z" banner first.
-      const banner = text.match(
-        /Kilometres:\s*([\d,]+)\s*[•\-–]\s*VIN:\s*([A-HJ-NPR-Z0-9]{11,17})\s*[•\-–]\s*Stock\s*#:\s*([A-Z0-9\-]+)/i
-      );
+    // Banner can be bullet-separated or just spaced, so be flexible:
+    // "Kilometres: 78,385 • VIN: ... • Stock #: ..."
+    const banner =
+      collapsed.match(
+        /Kilometres\s*[:#]?\s*([\d,]+)\s*(?:[•\-–]|·|\||\s)\s*VIN\s*[:#]?\s*([A-HJ-NPR-Z0-9]{11,17})\s*(?:[•\-–]|·|\||\s)\s*Stock\s*#\s*[:#]?\s*([A-Z0-9\-]+)/i
+      ) || null;
 
-      // Fallback values
-      const mileage = banner?.[1] || (text.match(/Mileage\s*([\d,]+)/i)?.[1] ?? null);
-      const vin = banner?.[2] || (text.match(/\bVIN\s*[:#]?\s*([A-HJ-NPR-Z0-9]{11,17})\b/i)?.[1] ?? null);
-      const stock =
-        banner?.[3] ||
-        (text.match(/\bStock\s*#\s*[:#]?\s*([A-Z0-9\-]+)\b/i)?.[1] ?? null);
+    const mileage =
+      (banner && banner[1]) ||
+      (collapsed.match(/Kilometres\s*[:#]?\s*([\d,]+)/i)?.[1] ?? null) ||
+      (collapsed.match(/\bMileage\s*[:#]?\s*([\d,]+)/i)?.[1] ?? null);
 
-      // Price: prefer "Purchase Price" then "Retail Price".
-      const purchasePrice = text.match(/Purchase Price\s*\$\s*([\d,]+)/i)?.[1] ?? null;
-      const retailPrice = text.match(/Retail Price\s*\$\s*([\d,]+)/i)?.[1] ?? null;
-      const price = purchasePrice || retailPrice || (text.match(/\$\s*([\d,]{4,})/)?.[1] ?? null);
+    const vin =
+      (banner && banner[2]) ||
+      (collapsed.match(/\bVIN\s*[:#]?\s*([A-HJ-NPR-Z0-9]{11,17})\b/i)?.[1] ?? null);
 
-      const transmission = text.match(/Transmission\s*([A-Za-z0-9\- ]+)/i)?.[1] ?? null;
-      const exteriorColor = text.match(/Exterior Color\s*([A-Za-z0-9\- ]+)/i)?.[1] ?? null;
+    const stock =
+      (banner && banner[3]) ||
+      (collapsed.match(/\bStock\s*#\s*[:#]?\s*([A-Z0-9\-]+)\b/i)?.[1] ?? null);
 
-      return {
-        mileage,
-        vin,
-        stock,
-        price,
-        transmission: transmission ? clean(transmission) : null,
-        exteriorColor: exteriorColor ? clean(exteriorColor) : null,
-      };
-    });
+    // Price: prefer "Purchase Price" then "Retail Price"
+    const purchasePrice = collapsed.match(/Purchase Price\s*[:#]?\s*\$?\s*([\d,]+)/i)?.[1] ?? null;
+    const retailPrice = collapsed.match(/Retail Price\s*[:#]?\s*\$?\s*([\d,]+)/i)?.[1] ?? null;
+    const price = purchasePrice || retailPrice || (collapsed.match(/\$\s*([\d,]{4,})/)?.[1] ?? null);
 
-    // Best-effort trim (your provided selector is reliable, but keep fallback)
+    // Line-based extraction (prevents capturing the whole rest of the page)
+    const txLine = raw.match(/(?:^|\n)\s*Transmission\s+([^\n]+)/i)?.[1] ?? null;
+    const exLine = raw.match(/(?:^|\n)\s*Exterior Color\s+([^\n]+)/i)?.[1] ?? null;
+
+    const clean = (s) => String(s || "").replace(/\s+/g, " ").trim();
+
+    return {
+      mileage: mileage ? clean(mileage) : null,
+      vin: vin ? clean(vin) : null,
+      stock: stock ? clean(stock) : null,
+      price: price ? clean(price) : null,
+      transmission: txLine ? clean(txLine) : null,
+      exteriorColor: exLine ? clean(exLine) : null,
+    };
+  });
+};
+
+let vdpData = await extractVdpData();
+const missingCritical =
+  !vdpData.vin && !vdpData.stock && !vdpData.mileage && !vdpData.price;
+
+if (missingCritical) {
+  console.warn("APPLEWOOD_VDP_EMPTY_RETRY:", { vdpUrl });
+  await p.reload({ waitUntil: "domcontentloaded", timeout: 60000 }).catch(() => {});
+  await p.waitForTimeout(1200);
+  vdpData = await extractVdpData();
+}
+// Best-effort trim (your provided selector is reliable, but keep fallback)
     const trim = cleanWhitespace(stripRegisteredSymbol(trimText)) || null;
 
     // Images (Applewood):
@@ -548,20 +585,6 @@ async function mapWithConcurrency(items, concurrency, fn) {
   return results;
 }
 
-
-// Hard timeout wrapper to prevent hung VDP scrapes from stalling the whole run
-async function withTimeout(promise, ms, label = "timeout") {
-  let t;
-  const timeout = new Promise((_, reject) => {
-    t = setTimeout(() => reject(new Error(`${label} after ${ms}ms`)), ms);
-  });
-  try {
-    return await Promise.race([promise, timeout]);
-  } finally {
-    clearTimeout(t);
-  }
-}
-
 /**
  * Download one image URL and upload to S3 (buffered).
  * Returns { s3Key, contentType, bytes } or null if failed.
@@ -668,40 +691,8 @@ async function downloadAndUploadImage({ imageUrlAbs, s3KeyBase }) {
     if (IS_APPLEWOOD) {
       // Applewood: SRP -> VDP URLs -> scrape each VDP for details + images
       const vdpUrls = await scrapeApplewoodVdpUrls(page, INVENTORY_URL);
-      const VDP_TIMEOUT_MS = Number(process.env.VDP_TIMEOUT_MS || 45000);
-
-      let done = 0;
-      vehicles = await mapWithConcurrency(vdpUrls, VDP_CONCURRENCY, async (url, i) => {
-        try {
-          const v = await withTimeout(
-            scrapeApplewoodVdp(context, url),
-            VDP_TIMEOUT_MS,
-            `VDP scrape ${url}`
-          );
-          return v;
-        } catch (e) {
-          // Return a minimal record so the run can complete and we can debug which VDP failed
-          return {
-            url,
-            year: null,
-            make: null,
-            model: null,
-            trim: null,
-            vin: null,
-            stockNumber: null,
-            mileage: null,
-            price: null,
-            transmission: null,
-            exteriorColor: null,
-            imageSourceUrls: [],
-            _warnings: [`vdp_failed:${String(e?.message || e)}`],
-          };
-        } finally {
-          done += 1;
-          if (done % 10 === 0) {
-            console.log("APPLEWOOD_VDP_PROGRESS:", { done, total: vdpUrls.length });
-          }
-        }
+      vehicles = await mapWithConcurrency(vdpUrls, VDP_CONCURRENCY, async (url) => {
+        return await scrapeApplewoodVdp(context, url);
       });
     } else {
       // Bank Street Hyundai (legacy scraper)
@@ -837,8 +828,7 @@ async function downloadAndUploadImage({ imageUrlAbs, s3KeyBase }) {
     // ✅ Normalize vehicles into final schema objects
     const scrapedAt = startedAt;
     const normalizedVehicles = vehicles.map((v) => {
-      const upstreamWarnings = Array.isArray(v._warnings) ? v._warnings : [];
-      const warnings = [...upstreamWarnings];
+      const warnings = [];
 
       const vinNorm = normalizeVin(v.vin);
       if (!vinNorm || vinNorm.length !== 17) warnings.push("vin_missing_or_invalid");
