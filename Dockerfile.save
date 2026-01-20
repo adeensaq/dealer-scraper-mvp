@@ -1,0 +1,14 @@
+cd ~/dealer-scraper-mvp
+nano Dockerfile
+cd ~/dealer-scraper-mvp
+nano Dockerfile
+
+
+
+
+RUN npm ci --omit=dev
+
+COPY src ./src
+ENV NODE_ENV=production
+
+CMD ["node", "src/run.js"]
